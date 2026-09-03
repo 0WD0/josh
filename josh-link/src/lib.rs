@@ -44,6 +44,16 @@ pub struct UpdateLinksResult {
     /// Commit after applying :link filter
     pub filtered_commit: gix_hash::ObjectId,
 }
+/// An updated materialized link tree and the clean tree it replaces.
+///
+/// Callers can use the previous materialization as the merge base when preserving local
+/// modifications on top of a newer linked snapshot.
+pub struct MaterializedLinkUpdateResult {
+    /// Commit produced by materializing the original link markers.
+    pub previous_materialized_commit: gix_hash::ObjectId,
+    /// Marker and materialized commits for the updated links.
+    pub update: UpdateLinksResult,
+}
 
 /// A remote URL and commit SHA found in a `.link.josh` file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -237,4 +247,123 @@ pub fn update_links(
         commit_with_updates,
         filtered_commit,
     }))
+}
+
+/// Update links in a tree where linked contents have already been materialized.
+///
+/// `update_links()` operates on the canonical marker-only representation. A native working copy
+/// contains both each marker and its projected files, so remove those files with `:unlink` first
+/// and then materialize both the old and updated markers. The old materialization is returned as
+/// the merge base callers need to preserve local changes.
+pub fn update_materialized_links(
+    transaction: &josh_core::cache::Transaction,
+    materialized_commit: gix_hash::ObjectId,
+    links_to_update: Vec<(PathBuf, gix_hash::ObjectId)>,
+    signature: &gix_actor::Signature,
+) -> anyhow::Result<Option<MaterializedLinkUpdateResult>> {
+    let unlink_filter =
+        josh_core::filter::parse(":unlink").context("Failed to parse :unlink filter")?;
+    let canonical_commit =
+        josh_core::filter_commit(transaction, unlink_filter, materialized_commit)
+            .context("Failed to canonicalize materialized links")?;
+    let link_filter = josh_core::filter::parse(":link").context("Failed to parse :link filter")?;
+    let previous_materialized_commit =
+        josh_core::filter_commit(transaction, link_filter, canonical_commit)
+            .context("Failed to materialize previous links")?;
+    let update = update_links(transaction, canonical_commit, links_to_update, signature)?;
+    Ok(update.map(|update| MaterializedLinkUpdateResult {
+        previous_materialized_commit,
+        update,
+    }))
+}
+
+/// Export the current contents at `path` back through the inverse of `filter`.
+///
+/// Returns `None` when the path has no content in `head_commit`. Callers can then fetch the
+/// configured remote instead. The exported commit is written to the transaction's object store
+/// and is suitable for recording as a link's pinned commit.
+pub fn export_link_source(
+    transaction: &josh_core::cache::Transaction,
+    head_commit: gix_hash::ObjectId,
+    path: &std::path::Path,
+    filter: &str,
+) -> anyhow::Result<Option<gix_hash::ObjectId>> {
+    let normalized_path = path
+        .to_str()
+        .ok_or_else(|| anyhow!("Link path is not valid UTF-8: '{}'", path.display()))?
+        .trim_matches('/');
+    if normalized_path.is_empty() {
+        return Err(anyhow!("Path cannot be empty"));
+    }
+
+    let path_filter = josh_core::filter::Filter::new().subdir(normalized_path);
+    let filter_obj = josh_core::filter::parse(filter)
+        .with_context(|| format!("Failed to parse filter '{filter}'"))?;
+    let combined_filter = path_filter.export()?.chain(
+        josh_core::filter::invert(filter_obj)
+            .with_context(|| format!("Filter '{filter}' has no inverse"))?,
+    );
+    let exported_commit = josh_core::filter_commit(transaction, combined_filter, head_commit)
+        .context("Failed to export existing link contents")?;
+    Ok(
+        (exported_commit != gix_hash::ObjectId::null(gix_hash::Kind::Sha1))
+            .then_some(exported_commit),
+    )
+}
+
+/// A link export ready to push to its own remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedLinkPush {
+    pub remote: String,
+    pub configured_target: String,
+    pub exported_commit: gix_hash::ObjectId,
+}
+
+/// Resolve a link at `path` and export its visible contents into the linked repository's layout.
+pub fn prepare_link_push(
+    transaction: &josh_core::cache::Transaction,
+    head_commit: gix_hash::ObjectId,
+    path: &std::path::Path,
+) -> anyhow::Result<PreparedLinkPush> {
+    let normalized_path = path
+        .to_str()
+        .ok_or_else(|| anyhow!("Link path is not valid UTF-8: '{}'", path.display()))?
+        .trim_matches('/');
+    if normalized_path.is_empty() {
+        return Err(anyhow!("Path cannot be empty"));
+    }
+
+    let head_tree = josh_core::git::read_tree_id(transaction.odb(), head_commit)
+        .context("Failed to get commit tree")?;
+    let link_path = PathBuf::from(normalized_path);
+    let link_files = josh_core::link::find_link_files(transaction.odb(), head_tree)
+        .context("Failed to find link files")?;
+    let (_, link_file) = link_files
+        .iter()
+        .find(|(candidate, _)| candidate == &link_path)
+        .ok_or_else(|| anyhow!("No link found at path '{}'", path.display()))?;
+    let remote = link_file
+        .get_meta("remote")
+        .ok_or_else(|| anyhow!("Link file missing 'remote' metadata"))?;
+    let configured_target = link_file
+        .get_meta("target")
+        .unwrap_or_else(|| "HEAD".to_string());
+    let exported_commit = josh_core::filter_commit(
+        transaction,
+        josh_core::filter::invert(*link_file)?,
+        head_commit,
+    )
+    .context("Failed to export link contents")?;
+    if exported_commit == gix_hash::ObjectId::null(gix_hash::Kind::Sha1) {
+        return Err(anyhow!(
+            "No content found at path '{}' to push",
+            path.display()
+        ));
+    }
+
+    Ok(PreparedLinkPush {
+        remote,
+        configured_target,
+        exported_commit,
+    })
 }
