@@ -102,24 +102,30 @@ fn handle_link_add(
     let mode = josh_core::filter::LinkMode::parse(&args.mode)
         .with_context(|| format!("Invalid link mode: '{}'", args.mode))?;
 
-    // Prefer the path's current contents, so adding a link to an existing directory preserves
-    // local work. If the path is absent, seed it from the configured remote.
-    let initial_oid = if let Some(export_oid) = josh_link::export_link_source(
-        transaction,
-        head_commit,
-        std::path::Path::new(&args.path),
-        filter,
-    )? {
+    // Compute the initial commit OID using the :export filter, the same way
+    // as `josh link push` does, so the stored commit reflects the local state.
+    let normalized_path = args.path.trim_matches('/');
+    let path_filter = josh_core::filter::Filter::new().subdir(normalized_path);
+    let filter_obj = josh_core::filter::parse(filter)
+        .with_context(|| format!("Failed to parse filter '{}'", filter))?;
+    let combined_filter = path_filter.export()?.chain(
+        josh_core::filter::invert(filter_obj)
+            .with_context(|| format!("Filter '{}' has no inverse", filter))?,
+    );
+    let export_oid = josh_core::filter_commit(transaction, combined_filter, head_commit)
+        .context("Failed to apply export filter")?;
+
+    // If the export filter found no local content, fall back to fetching the remote.
+    let initial_oid = if export_oid != gix_hash::ObjectId::null(gix_hash::Kind::Sha1) {
         eprintln!(
             "Using local content at '{}' ({})",
-            args.path.trim_matches('/'),
-            export_oid
+            normalized_path, export_oid
         );
         export_oid
     } else {
         eprintln!(
             "No local content at '{}', fetching from remote...",
-            args.path.trim_matches('/')
+            normalized_path
         );
 
         transaction
@@ -163,11 +169,7 @@ fn handle_link_add(
 
     eprintln!(
         "Added link '{}' with URL '{}', filter '{}', target '{}', and mode '{}'",
-        args.path.trim_matches('/'),
-        args.url,
-        filter,
-        target,
-        args.mode
+        normalized_path, args.url, filter, target, args.mode
     );
     eprintln!("Created branch: {}", branch_name);
 
@@ -341,27 +343,64 @@ fn handle_link_push(
     args: &LinkPushArgs,
     transaction: &josh_core::cache::Transaction,
 ) -> anyhow::Result<()> {
+    // Get current HEAD commit
     let head_commit = transaction.head().context("Failed to get HEAD")?.commit;
-    let prepared =
-        josh_link::prepare_link_push(transaction, head_commit, std::path::Path::new(&args.path))?;
+    let head_tree = josh_core::objects::CommitData::read(transaction.odb(), head_commit)?
+        .tree_id()
+        .context("Failed to get HEAD tree")?;
 
-    // Preserve the existing CLI behavior for links configured against HEAD. Native integrations
-    // can resolve HEAD or supply an explicit destination before executing the prepared push.
-    let push_ref = if prepared.configured_target == "HEAD" {
-        "refs/heads/master"
+    // Normalize path: strip slash(es)
+    let normalized_path = args.path.trim_matches('/');
+    if normalized_path.is_empty() {
+        return Err(anyhow!("Path cannot be empty"));
+    }
+
+    // Find the .link.josh file at the given path
+    let link_files = josh_core::link::find_link_files(transaction.odb(), head_tree)
+        .context("Failed to find link files")?;
+
+    let link_path = std::path::PathBuf::from(normalized_path);
+    let (_, link_file) = link_files
+        .iter()
+        .find(|(p, _)| p == &link_path)
+        .ok_or_else(|| anyhow!("No link found at path '{}'", args.path))?;
+
+    let remote = link_file
+        .get_meta("remote")
+        .ok_or_else(|| anyhow!("Link file missing 'remote' metadata"))?;
+    let target = link_file
+        .get_meta("target")
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    // Build the export filter: subdir extracts the link path, :export strips .link.josh
+    let path_filter = josh_core::filter::Filter::new();
+    let combined_filter = path_filter.chain(josh_core::filter::invert(*link_file)?);
+
+    // Apply the filter to get the commit suitable for pushing
+    let exported_commit = josh_core::filter_commit(transaction, combined_filter, head_commit)
+        .context("Failed to apply export filter")?;
+
+    if exported_commit == gix_hash::ObjectId::null(gix_hash::Kind::Sha1) {
+        return Err(anyhow!("No content found at path '{}' to push", args.path));
+    }
+
+    // Determine the destination ref: treat "HEAD" as "master" for push
+    // FIXME: this needs to properly resolve the HEAD symref
+    let push_ref = if target == "HEAD" {
+        "refs/heads/master".to_string()
     } else {
-        &prepared.configured_target
+        target.clone()
     };
     let refspec = format!(
         "{}{}:{}",
         if args.force { "+" } else { "" },
-        prepared.exported_commit,
+        exported_commit,
         push_ref
     );
 
     transaction
-        .spawn_git(&["push", &prepared.remote, &refspec], &[])
-        .with_context(|| format!("Failed to push to '{}'", prepared.remote))?;
+        .spawn_git(&["push", &remote, &refspec], &[])
+        .with_context(|| format!("Failed to push to '{}'", remote))?;
 
     Ok(())
 }
